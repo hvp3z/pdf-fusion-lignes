@@ -14,8 +14,6 @@ import re
 import time
 from dotenv import load_dotenv
 import os
-import logging
-from pathlib import Path
 
 # Charger les variables d'environnement
 load_dotenv()
@@ -30,26 +28,6 @@ st.set_page_config(
 # Constantes
 MAX_FILES = 15
 GEMINI_MODEL = "gemini-2.5-flash"  # Mise à jour : gemini-1.5-flash n'est plus disponible
-
-# Configuration des logs pour un environnement déployé
-DEBUG_LOG_ENABLED = os.getenv("DEBUG_LOG_ENABLED", "false").lower() == "true"
-DEBUG_LOG_PATH = Path(__file__).parent / "debug.log"
-
-
-def write_debug_log(log_data: dict) -> None:
-    """
-    Écrit une entrée de log dans un fichier local si les logs de debug sont activés.
-    Utilise un chemin relatif (dans le même dossier que ce fichier) pour être compatible
-    avec un déploiement sur Streamlit Cloud.
-    """
-    if not DEBUG_LOG_ENABLED:
-        return
-    try:
-        with DEBUG_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(log_data) + "\n")
-    except Exception:
-        # Ne jamais faire planter l'app à cause des logs
-        pass
 
 # Prompt système pour Gemini
 SYSTEM_PROMPT = """Tu es un assistant comptable expert spécialisé dans l'analyse de relevés bancaires français.
@@ -126,113 +104,69 @@ def analyze_with_gemini(text: str, api_key: str) -> str:
         str: Réponse du modèle (JSON attendu)
     """
     try:
-        # #region agent log
-        log_data = {
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": "A",
-            "location": "app.py:107",
-            "message": "API configuration start",
-            "data": {"model_name": GEMINI_MODEL, "api_key_length": len(api_key) if api_key else 0},
-            "timestamp": int(time.time() * 1000)
-        }
-        write_debug_log(log_data)
-        # #endregion
-        
         genai.configure(api_key=api_key)
-        
-        # #region agent log
-        log_data = {
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": "B",
-            "location": "app.py:109",
-            "message": "Creating GenerativeModel",
-            "data": {"model_name": GEMINI_MODEL, "genai_version": getattr(genai, "__version__", "unknown")},
-            "timestamp": int(time.time() * 1000)
-        }
-        write_debug_log(log_data)
-        # #endregion
-        
         model = genai.GenerativeModel(GEMINI_MODEL)
-        
-        # #region agent log
-        log_data = {
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": "C",
-            "location": "app.py:111",
-            "message": "Model created, checking available models",
-            "data": {"model_name": GEMINI_MODEL},
-            "timestamp": int(time.time() * 1000)
-        }
-        try:
-            available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-            log_data["data"]["available_models"] = available_models
-        except Exception as list_err:
-            log_data["data"]["list_models_error"] = str(list_err)
-        write_debug_log(log_data)
-        # #endregion
         
         # Construire le prompt complet
         full_prompt = SYSTEM_PROMPT + text
         
-        # #region agent log
-        log_data = {
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": "D",
-            "location": "app.py:114",
-            "message": "Before generate_content call",
-            "data": {"model_name": GEMINI_MODEL, "prompt_length": len(full_prompt)},
-            "timestamp": int(time.time() * 1000)
-        }
-        write_debug_log(log_data)
-        # #endregion
-        
-        # Générer la réponse
+        # Générer la réponse avec mode JSON structuré
         response = model.generate_content(
             full_prompt,
             generation_config=genai.types.GenerationConfig(
                 temperature=0.1,  # Basse température pour plus de précision
-                max_output_tokens=8192,
+                max_output_tokens=16384,  # Augmenté pour les relevés avec beaucoup de transactions
+                response_mime_type="application/json",  # Force Gemini à produire un JSON valide
             )
         )
-        
-        # #region agent log
-        log_data = {
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": "E",
-            "location": "app.py:122",
-            "message": "generate_content succeeded",
-            "data": {"response_length": len(response.text) if response.text else 0},
-            "timestamp": int(time.time() * 1000)
-        }
-        write_debug_log(log_data)
-        # #endregion
         
         return response.text
     
     except Exception as e:
-        # #region agent log
-        log_data = {
-            "sessionId": "debug-session",
-            "runId": "run1",
-            "hypothesisId": "ALL",
-            "location": "app.py:125",
-            "message": "Exception caught in analyze_with_gemini",
-            "data": {
-                "error_type": type(e).__name__,
-                "error_message": str(e),
-                "error_repr": repr(e),
-                "model_name": GEMINI_MODEL
-            },
-            "timestamp": int(time.time() * 1000)
-        }
-        write_debug_log(log_data)
-        # #endregion
         raise Exception(f"Erreur API Gemini: {str(e)}")
+
+
+def repair_json(json_string: str) -> str:
+    """
+    Répare un JSON potentiellement malformé ou tronqué.
+    
+    Args:
+        json_string: Chaîne JSON potentiellement malformée
+        
+    Returns:
+        str: Chaîne JSON nettoyée et réparée
+    """
+    cleaned = json_string.strip()
+    
+    # Enlever les marqueurs markdown
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    if cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+    
+    # Supprimer les virgules traînantes: ,} ou ,]
+    cleaned = re.sub(r',\s*}', '}', cleaned)
+    cleaned = re.sub(r',\s*]', ']', cleaned)
+    
+    # Vérifier si le JSON est tronqué (brackets non fermés)
+    open_braces = cleaned.count('{') - cleaned.count('}')
+    open_brackets = cleaned.count('[') - cleaned.count(']')
+    
+    if open_braces > 0 or open_brackets > 0:
+        # Tronquer au dernier objet complet et fermer le tableau
+        last_complete = cleaned.rfind('},')
+        if last_complete > 0:
+            cleaned = cleaned[:last_complete + 1] + ']'
+        else:
+            # Essayer de trouver le dernier objet complet sans virgule
+            last_obj = cleaned.rfind('}')
+            if last_obj > 0:
+                cleaned = cleaned[:last_obj + 1] + ']'
+    
+    return cleaned
 
 
 def parse_llm_response(response: str, filename: str) -> pd.DataFrame:
@@ -247,15 +181,8 @@ def parse_llm_response(response: str, filename: str) -> pd.DataFrame:
         pd.DataFrame: DataFrame avec les transactions
     """
     try:
-        # Nettoyer la réponse (enlever les éventuels backticks markdown)
-        cleaned = response.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned[7:]
-        if cleaned.startswith("```"):
-            cleaned = cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
-        cleaned = cleaned.strip()
+        # Utiliser repair_json pour nettoyer et réparer la réponse
+        cleaned = repair_json(response)
         
         # Parser le JSON
         transactions = json.loads(cleaned)
@@ -296,7 +223,31 @@ def parse_llm_response(response: str, filename: str) -> pd.DataFrame:
         return df
     
     except json.JSONDecodeError as e:
-        raise ValueError(f"Erreur de parsing JSON: {str(e)}\nRéponse reçue: {response[:500]}...")
+        # Tentative de récupération: extraire les transactions valides avant l'erreur
+        try:
+            # Chercher le dernier objet JSON complet
+            last_valid = cleaned.rfind('},')
+            if last_valid > 0:
+                truncated = cleaned[:last_valid + 1] + ']'
+                transactions = json.loads(truncated)
+                if isinstance(transactions, list) and len(transactions) > 0:
+                    df = pd.DataFrame(transactions)
+                    column_mapping = {"date": "Date", "libelle": "Libellé", "debit": "Débit", "credit": "Crédit"}
+                    df = df.rename(columns=column_mapping)
+                    df["Source"] = filename
+                    for col in ["Débit", "Crédit"]:
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col], errors='coerce')
+                    expected_cols = ["Date", "Libellé", "Débit", "Crédit", "Source"]
+                    for col in expected_cols:
+                        if col not in df.columns:
+                            df[col] = None
+                    # Retourner les données partielles si possible
+                    return df[expected_cols]
+        except Exception:
+            pass  # Si la récupération échoue, on lève l'erreur originale
+        
+        raise ValueError(f"Erreur de parsing JSON: {str(e)}\nRéponse reçue (500 premiers caractères): {response[:500]}...")
     except Exception as e:
         raise ValueError(f"Erreur lors du traitement de la réponse: {str(e)}")
 
