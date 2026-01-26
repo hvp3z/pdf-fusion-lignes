@@ -14,6 +14,8 @@ import re
 import time
 from dotenv import load_dotenv
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 # Charger les variables d'environnement
 load_dotenv()
@@ -92,38 +94,54 @@ def extract_text_from_pdf(pdf_file) -> str:
         raise Exception(f"Erreur lors de la lecture du PDF: {str(e)}")
 
 
-def analyze_with_gemini(text: str, api_key: str) -> str:
+def analyze_with_gemini(text: str, api_key: str, max_retries: int = 3) -> str:
     """
-    Envoie le texte au modèle Gemini pour analyse.
+    Envoie le texte au modèle Gemini pour analyse avec retry automatique.
     
     Args:
         text: Texte extrait du PDF
         api_key: Clé API Gemini
+        max_retries: Nombre maximum de tentatives en cas d'erreur
         
     Returns:
         str: Réponse du modèle (JSON attendu)
     """
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        
-        # Construire le prompt complet
-        full_prompt = SYSTEM_PROMPT + text
-        
-        # Générer la réponse avec mode JSON structuré
-        response = model.generate_content(
-            full_prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.1,  # Basse température pour plus de précision
-                max_output_tokens=16384,  # Augmenté pour les relevés avec beaucoup de transactions
-                response_mime_type="application/json",  # Force Gemini à produire un JSON valide
+    for attempt in range(max_retries):
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(GEMINI_MODEL)
+            
+            # Construire le prompt complet
+            full_prompt = SYSTEM_PROMPT + text
+            
+            # Générer la réponse avec mode JSON structuré
+            response = model.generate_content(
+                full_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,  # Basse température pour plus de précision
+                    max_output_tokens=16384,  # Augmenté pour les relevés avec beaucoup de transactions
+                    response_mime_type="application/json",  # Force Gemini à produire un JSON valide
+                )
             )
-        )
+            
+            return response.text
         
-        return response.text
-    
-    except Exception as e:
-        raise Exception(f"Erreur API Gemini: {str(e)}")
+        except Exception as e:
+            error_msg = str(e).lower()
+            # Vérifier si c'est une erreur de rate limit
+            is_rate_limit = any(keyword in error_msg for keyword in ['rate limit', 'quota', '429', 'too many requests'])
+            
+            if is_rate_limit and attempt < max_retries - 1:
+                # Attendre progressivement plus longtemps à chaque retry
+                wait_time = (attempt + 1) * 2
+                time.sleep(wait_time)
+                continue
+            elif attempt < max_retries - 1:
+                # Pour les autres erreurs, attendre un peu avant de réessayer
+                time.sleep(1)
+                continue
+            else:
+                raise Exception(f"Erreur API Gemini après {max_retries} tentatives: {str(e)}")
 
 
 def repair_json(json_string: str) -> str:
@@ -297,6 +315,49 @@ def convert_df_to_excel(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+def process_single_pdf(pdf_file, api_key: str, progress_lock: Lock, progress_dict: dict):
+    """
+    Traite un seul fichier PDF et retourne le résultat.
+    
+    Args:
+        pdf_file: Fichier PDF uploadé via Streamlit
+        api_key: Clé API Gemini
+        progress_lock: Lock pour synchroniser les mises à jour de progression
+        progress_dict: Dictionnaire partagé pour suivre la progression
+        
+    Returns:
+        tuple: (filename, df, error) où df est un DataFrame ou None, et error est un message d'erreur ou None
+    """
+    filename = pdf_file.name
+    try:
+        # Étape 1: Extraction du texte
+        text = extract_text_from_pdf(pdf_file)
+        
+        if not text.strip():
+            return (filename, None, "Le PDF ne contient pas de texte extractible")
+        
+        # Étape 2: Analyse avec Gemini
+        response = analyze_with_gemini(text, api_key)
+        
+        # Étape 3: Parsing de la réponse
+        df = parse_llm_response(response, filename)
+        
+        # Mettre à jour la progression
+        with progress_lock:
+            progress_dict['completed'] = progress_dict.get('completed', 0) + 1
+        
+        return (filename, df, None)
+    
+    except Exception as e:
+        # Mettre à jour la progression même en cas d'erreur
+        with progress_lock:
+            progress_dict['completed'] = progress_dict.get('completed', 0) + 1
+            progress_dict['errors'] = progress_dict.get('errors', [])
+            progress_dict['errors'].append((filename, str(e)))
+        
+        return (filename, None, str(e))
+
+
 def verify_api_key(api_key: str) -> bool:
     """
     Vérifie si la clé API Gemini est valide.
@@ -357,6 +418,17 @@ def main():
                         st.error("❌ Clé API invalide")
         
         st.divider()
+        st.markdown("### ⚡ Performance")
+        num_workers = st.slider(
+            "Nombre de fichiers traités en parallèle",
+            min_value=1,
+            max_value=8,
+            value=4,
+            help="Augmentez ce nombre pour traiter plus de fichiers simultanément. Attention aux limites de l'API Gemini.",
+            key="num_workers"
+        )
+        
+        st.divider()
         st.markdown("### 📋 Instructions")
         st.markdown("""
         1. Uploadez vos relevés PDF (max 15)
@@ -370,6 +442,8 @@ def main():
         Cette application utilise **Gemini 2.5 Flash** 
         pour analyser vos relevés bancaires et extraire 
         automatiquement les transactions.
+        
+        **Optimisation** : Traitement parallèle activé pour améliorer les performances.
         """)
     
     # Zone principale
@@ -416,46 +490,56 @@ def main():
         all_dataframes = []
         errors = []
         
+        # Récupérer le nombre de workers depuis la session state ou utiliser la valeur par défaut
+        num_workers = st.session_state.get('num_workers', 4)
+        
         # Barre de progression
         progress_bar = st.progress(0)
         status_text = st.empty()
+        status_container = st.container()
         
-        for i, pdf_file in enumerate(uploaded_files):
-            progress = (i + 1) / len(uploaded_files)
-            status_text.text(f"📄 Traitement de {pdf_file.name}... ({i + 1}/{len(uploaded_files)})")
+        # Dictionnaire partagé pour suivre la progression
+        progress_dict = {'completed': 0, 'total': len(uploaded_files), 'errors': []}
+        progress_lock = Lock()
+        
+        # Afficher le nombre de workers utilisés
+        status_text.text(f"🚀 Démarrage du traitement parallèle ({num_workers} fichiers simultanés)...")
+        
+        # Traitement parallèle avec ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Soumettre toutes les tâches
+            future_to_file = {
+                executor.submit(process_single_pdf, pdf_file, api_key, progress_lock, progress_dict): pdf_file
+                for pdf_file in uploaded_files
+            }
             
-            try:
-                # Étape 1: Extraction du texte
-                status_text.text(f"📄 {pdf_file.name} - Extraction du texte...")
-                text = extract_text_from_pdf(pdf_file)
+            # Créer un conteneur pour les messages de statut par fichier
+            status_placeholders = {}
+            for pdf_file in uploaded_files:
+                status_placeholders[pdf_file.name] = status_container.empty()
+            
+            # Traiter les résultats au fur et à mesure qu'ils arrivent
+            for future in as_completed(future_to_file):
+                filename, df, error = future.result()
                 
-                if not text.strip():
-                    raise ValueError("Le PDF ne contient pas de texte extractible")
+                # Mettre à jour la barre de progression
+                completed = progress_dict['completed']
+                total = progress_dict['total']
+                progress = completed / total
+                progress_bar.progress(progress)
                 
-                # Étape 2: Analyse avec Gemini
-                status_text.text(f"📄 {pdf_file.name} - Analyse IA en cours...")
-                response = analyze_with_gemini(text, api_key)
+                # Afficher le statut
+                status_text.text(f"📊 Progression : {completed}/{total} fichiers traités ({int(progress * 100)}%)")
                 
-                # Étape 3: Parsing de la réponse
-                status_text.text(f"📄 {pdf_file.name} - Traitement des données...")
-                df = parse_llm_response(response, pdf_file.name)
-                
-                if len(df) > 0:
+                if error:
+                    error_msg = f"❌ {filename} : {error}"
+                    errors.append(error_msg)
+                    status_placeholders[filename].error(error_msg)
+                elif df is not None and len(df) > 0:
                     all_dataframes.append(df)
-                    st.success(f"✅ {pdf_file.name} : {len(df)} transactions extraites")
+                    status_placeholders[filename].success(f"✅ {filename} : {len(df)} transactions extraites")
                 else:
-                    st.warning(f"⚠️ {pdf_file.name} : Aucune transaction trouvée")
-                
-            except Exception as e:
-                error_msg = f"❌ {pdf_file.name} : {str(e)}"
-                errors.append(error_msg)
-                st.error(error_msg)
-            
-            progress_bar.progress(progress)
-            
-            # Petit délai pour éviter le rate limiting
-            if i < len(uploaded_files) - 1:
-                time.sleep(0.5)
+                    status_placeholders[filename].warning(f"⚠️ {filename} : Aucune transaction trouvée")
         
         progress_bar.progress(1.0)
         status_text.text("✅ Traitement terminé !")
