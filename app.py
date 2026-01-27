@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
+from datetime import datetime
 
 # Charger les variables d'environnement
 load_dotenv()
@@ -34,10 +35,10 @@ GEMINI_MODEL = "gemini-2.5-flash"  # Mise à jour : gemini-1.5-flash n'est plus 
 # Prompt système pour Gemini
 SYSTEM_PROMPT = """Tu es un assistant comptable expert spécialisé dans l'analyse de relevés bancaires français.
 
-MISSION : Analyse le relevé bancaire fourni et extrais TOUTES les lignes de transactions.
+MISSION : Analyse le relevé bancaire fourni et extrais TOUTES les lignes de transactions, SANS EN OMETTRE AUCUNE.
 
 Pour chaque transaction, retourne un objet JSON avec :
-- "date": la date de la transaction au format JJ/MM/AAAA
+- "date": la date de la transaction au format JJ/MM/AAAA (IMPORTANT: si la date dans le PDF est au format JJ/MM seulement, reconstitue la date complète en utilisant l'année mentionnée dans l'en-tête du relevé, par exemple "Arrêté mensuel du 1 au 30 avril 2025" indique que l'année est 2025)
 - "libelle": le libellé de l'opération. Si le libellé dépasse 50 caractères, résume-le de manière concise en gardant les mots-clés essentiels (nom du bénéficiaire, type d'opération, référence importante).
 - "debit": le montant en débit sous forme de nombre flottant (ex: 1234.56). Mettre null si c'est un crédit.
 - "credit": le montant en crédit sous forme de nombre flottant (ex: 1234.56). Mettre null si c'est un débit.
@@ -51,7 +52,9 @@ RÈGLES IMPORTANTES :
 2. Ne confonds pas débit et crédit. Un débit est une sortie d'argent (paiement), un crédit est une entrée (virement reçu).
 3. Ignore les lignes qui ne sont pas des transactions (soldes, totaux, en-têtes, etc.).
 4. Si une transaction s'étend sur plusieurs lignes dans le PDF, reconstitue-la correctement.
-5. Réponds UNIQUEMENT avec un tableau JSON valide, sans texte avant ou après.
+5. CRITIQUE : Extrais ABSOLUMENT TOUTES les transactions, y compris celles en fin de relevé. Ne tronque pas ta réponse même si elle est longue.
+6. Les dates peuvent être au format JJ/MM dans le PDF - reconstitue-les en JJ/MM/AAAA en utilisant l'année du relevé.
+7. Réponds UNIQUEMENT avec un tableau JSON valide, sans texte avant ou après.
 
 FORMAT DE RÉPONSE ATTENDU (JSON uniquement) :
 [
@@ -73,6 +76,7 @@ def extract_text_from_pdf(pdf_file) -> str:
     Returns:
         str: Texte brut concaténé de toutes les pages
     """
+    log_path = r"c:\Users\matdi\Documents\myApps\pdf-merge-converted\.cursor\debug.log"
     try:
         # Lire le contenu du fichier uploadé
         pdf_bytes = pdf_file.read()
@@ -81,6 +85,11 @@ def extract_text_from_pdf(pdf_file) -> str:
         # Ouvrir le PDF avec PyMuPDF
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         
+        # #region agent log
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({"id": f"log_{int(time.time())}_extract_start", "timestamp": int(time.time() * 1000), "location": "app.py:82", "message": "extract_text_from_pdf - PDF opened", "data": {"filename": pdf_file.name, "page_count": len(doc)}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
+        # #endregion
+        
         full_text = []
         for page_num in range(len(doc)):
             page = doc[page_num]
@@ -88,7 +97,26 @@ def extract_text_from_pdf(pdf_file) -> str:
             full_text.append(f"--- Page {page_num + 1} ---\n{text}")
         
         doc.close()
-        return "\n\n".join(full_text)
+        extracted_text = "\n\n".join(full_text)
+        
+        # #region agent log
+        with open(log_path, 'a', encoding='utf-8') as f:
+            # Chercher des dates dans le texte extrait pour vérifier la présence des dates problématiques
+            date_patterns = [
+                r'25/02/2025', r'26/02/2025', r'27/02/2025', r'28/02/2025',
+                r'13/03/2025', r'31/03/2025',
+                r'14/04/2025', r'30/04/2025',
+                r'09/12/2025', r'31/12/2025'
+            ]
+            found_dates = {}
+            for pattern in date_patterns:
+                matches = re.findall(pattern, extracted_text)
+                if matches:
+                    found_dates[pattern] = len(matches)
+            f.write(json.dumps({"id": f"log_{int(time.time())}_extract_end", "timestamp": int(time.time() * 1000), "location": "app.py:91", "message": "extract_text_from_pdf - text extracted", "data": {"filename": pdf_file.name, "text_length": len(extracted_text), "found_problematic_dates": found_dates}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
+        # #endregion
+        
+        return extracted_text
     
     except Exception as e:
         raise Exception(f"Erreur lors de la lecture du PDF: {str(e)}")
@@ -114,15 +142,26 @@ def analyze_with_gemini(text: str, api_key: str, max_retries: int = 3) -> str:
             # Construire le prompt complet
             full_prompt = SYSTEM_PROMPT + text
             
+            # #region agent log
+            log_path = r"c:\Users\matdi\Documents\myApps\pdf-merge-converted\.cursor\debug.log"
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps({"id": f"log_{int(time.time())}_gemini_req", "timestamp": int(time.time() * 1000), "location": "app.py:115", "message": "Gemini request - input text length", "data": {"text_length": len(text), "prompt_length": len(full_prompt)}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
+            # #endregion
+            
             # Générer la réponse avec mode JSON structuré
             response = model.generate_content(
                 full_prompt,
                 generation_config=genai.types.GenerationConfig(
                     temperature=0.1,  # Basse température pour plus de précision
-                    max_output_tokens=16384,  # Augmenté pour les relevés avec beaucoup de transactions
+                    max_output_tokens=32768,  # Augmenté pour éviter la troncature (limite max de Gemini)
                     response_mime_type="application/json",  # Force Gemini à produire un JSON valide
                 )
             )
+            
+            # #region agent log
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps({"id": f"log_{int(time.time())}_gemini_resp", "timestamp": int(time.time() * 1000), "location": "app.py:127", "message": "Gemini response - raw response length", "data": {"response_length": len(response.text), "response_preview": response.text[:200]}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
+            # #endregion
             
             return response.text
         
@@ -154,6 +193,12 @@ def repair_json(json_string: str) -> str:
     Returns:
         str: Chaîne JSON nettoyée et réparée
     """
+    # #region agent log
+    log_path = r"c:\Users\matdi\Documents\myApps\pdf-merge-converted\.cursor\debug.log"
+    with open(log_path, 'a', encoding='utf-8') as f:
+        f.write(json.dumps({"id": f"log_{int(time.time())}_repair_before", "timestamp": int(time.time() * 1000), "location": "app.py:157", "message": "repair_json - before repair", "data": {"input_length": len(json_string), "input_preview": json_string[:300]}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
+    # #endregion
+    
     cleaned = json_string.strip()
     
     # Enlever les marqueurs markdown
@@ -173,7 +218,12 @@ def repair_json(json_string: str) -> str:
     open_braces = cleaned.count('{') - cleaned.count('}')
     open_brackets = cleaned.count('[') - cleaned.count(']')
     
+    was_truncated = False
+    chars_removed = 0
+    
     if open_braces > 0 or open_brackets > 0:
+        was_truncated = True
+        original_length = len(cleaned)
         # Tronquer au dernier objet complet et fermer le tableau
         last_complete = cleaned.rfind('},')
         if last_complete > 0:
@@ -183,6 +233,12 @@ def repair_json(json_string: str) -> str:
             last_obj = cleaned.rfind('}')
             if last_obj > 0:
                 cleaned = cleaned[:last_obj + 1] + ']'
+        chars_removed = original_length - len(cleaned)
+    
+    # #region agent log
+    with open(log_path, 'a', encoding='utf-8') as f:
+        f.write(json.dumps({"id": f"log_{int(time.time())}_repair_after", "timestamp": int(time.time() * 1000), "location": "app.py:187", "message": "repair_json - after repair", "data": {"output_length": len(cleaned), "was_truncated": was_truncated, "chars_removed": chars_removed, "open_braces": open_braces, "open_brackets": open_brackets}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
+    # #endregion
     
     return cleaned
 
@@ -198,12 +254,19 @@ def parse_llm_response(response: str, filename: str) -> pd.DataFrame:
     Returns:
         pd.DataFrame: DataFrame avec les transactions
     """
+    log_path = r"c:\Users\matdi\Documents\myApps\pdf-merge-converted\.cursor\debug.log"
     try:
         # Utiliser repair_json pour nettoyer et réparer la réponse
         cleaned = repair_json(response)
         
         # Parser le JSON
         transactions = json.loads(cleaned)
+        
+        # #region agent log
+        with open(log_path, 'a', encoding='utf-8') as f:
+            dates = [t.get('date', '') for t in transactions if isinstance(t, dict)]
+            f.write(json.dumps({"id": f"log_{int(time.time())}_parse_before", "timestamp": int(time.time() * 1000), "location": "app.py:206", "message": "parse_llm_response - transactions parsed", "data": {"filename": filename, "transaction_count": len(transactions), "dates": dates[:10] if dates else [], "date_count": len(dates)}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "C"}) + "\n")
+        # #endregion
         
         if not isinstance(transactions, list):
             raise ValueError("La réponse n'est pas une liste de transactions")
@@ -237,6 +300,25 @@ def parse_llm_response(response: str, filename: str) -> pd.DataFrame:
             if col not in df.columns:
                 df[col] = None
         df = df[expected_cols]
+        
+        # #region agent log
+        with open(log_path, 'a', encoding='utf-8') as f:
+            dates_in_df = df['Date'].dropna().tolist() if 'Date' in df.columns else []
+            date_ranges = {}
+            if dates_in_df:
+                try:
+                    parsed_dates = []
+                    for d in dates_in_df:
+                        try:
+                            parsed_dates.append(datetime.strptime(d, "%d/%m/%Y"))
+                        except:
+                            pass
+                    if parsed_dates:
+                        date_ranges = {"min_date": min(parsed_dates).strftime("%d/%m/%Y"), "max_date": max(parsed_dates).strftime("%d/%m/%Y"), "unique_dates": len(set(parsed_dates))}
+                except:
+                    pass
+            f.write(json.dumps({"id": f"log_{int(time.time())}_parse_after", "timestamp": int(time.time() * 1000), "location": "app.py:240", "message": "parse_llm_response - final DataFrame", "data": {"filename": filename, "row_count": len(df), "date_ranges": date_ranges, "sample_dates": dates_in_df[:5]}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "C"}) + "\n")
+        # #endregion
         
         return df
     
@@ -272,18 +354,39 @@ def parse_llm_response(response: str, filename: str) -> pd.DataFrame:
 
 def aggregate_results(dataframes: list) -> pd.DataFrame:
     """
-    Agrège tous les DataFrames en un seul.
+    Agrège tous les DataFrames en un seul et les trie par date chronologique.
     
     Args:
         dataframes: Liste de DataFrames à combiner
         
     Returns:
-        pd.DataFrame: DataFrame unifié
+        pd.DataFrame: DataFrame unifié trié par date
     """
     if not dataframes:
         return pd.DataFrame(columns=["Date", "Libellé", "Débit", "Crédit", "Source"])
     
     combined = pd.concat(dataframes, ignore_index=True)
+    
+    # Trier par date chronologique
+    if "Date" in combined.columns and len(combined) > 0:
+        # Créer une colonne temporaire avec les dates converties en datetime
+        def parse_date(date_str):
+            """Convertit une date au format JJ/MM/AAAA en datetime"""
+            if pd.isna(date_str) or date_str is None:
+                return pd.NaT
+            try:
+                return pd.to_datetime(date_str, format="%d/%m/%Y", errors='coerce')
+            except:
+                return pd.NaT
+        
+        combined['_date_sort'] = combined['Date'].apply(parse_date)
+        # Trier par date (les NaT seront en dernier)
+        combined = combined.sort_values('_date_sort', na_position='last')
+        # Supprimer la colonne temporaire
+        combined = combined.drop(columns=['_date_sort'])
+        # Réinitialiser l'index
+        combined = combined.reset_index(drop=True)
+    
     return combined
 
 
@@ -358,26 +461,6 @@ def process_single_pdf(pdf_file, api_key: str, progress_lock: Lock, progress_dic
         return (filename, None, str(e))
 
 
-def verify_api_key(api_key: str) -> bool:
-    """
-    Vérifie si la clé API Gemini est valide.
-    
-    Args:
-        api_key: Clé API à vérifier
-        
-    Returns:
-        bool: True si la clé est valide
-    """
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        # Test simple
-        response = model.generate_content("Dis 'OK'")
-        return True
-    except Exception:
-        return False
-
-
 def main():
     """Fonction principale de l'application."""
     
@@ -404,30 +487,8 @@ def main():
         # Gestion de la clé API
         api_key = os.getenv("GEMINI_API_KEY", "")
         
-        if api_key and api_key != "your_api_key_here":
-            st.success("✅ Clé API chargée depuis .env")
-            use_env_key = st.checkbox("Utiliser la clé du fichier .env", value=True)
-            if not use_env_key:
-                api_key = st.text_input("Clé API Gemini", type="password")
-        else:
-            st.warning("⚠️ Aucune clé API trouvée dans .env")
-            st.markdown("""
-            **Pour configurer votre clé API :**
-            1. Créez un fichier `.env` à la racine du projet
-            2. Ajoutez : `GEMINI_API_KEY=votre_clé`
-            
-            Ou entrez-la directement ci-dessous :
-            """)
+        if not api_key or api_key == "your_api_key_here":
             api_key = st.text_input("Clé API Gemini", type="password")
-        
-        # Vérification de la clé
-        if api_key and api_key != "your_api_key_here":
-            if st.button("🔍 Vérifier la connexion"):
-                with st.spinner("Vérification..."):
-                    if verify_api_key(api_key):
-                        st.success("✅ Connexion réussie !")
-                    else:
-                        st.error("❌ Clé API invalide")
         
         st.divider()
         st.markdown("### ⚡ Performance")
@@ -435,7 +496,7 @@ def main():
             "Nombre de fichiers traités en parallèle",
             min_value=1,
             max_value=8,
-            value=4,
+            value=8,
             help="Augmentez ce nombre pour traiter plus de fichiers simultanément. Attention aux limites de l'API Gemini.",
             key="num_workers"
         )
@@ -455,7 +516,6 @@ def main():
         pour analyser vos relevés bancaires et extraire 
         automatiquement les transactions.
         
-        **Optimisation** : Traitement parallèle activé pour améliorer les performances.
         """)
     
     # Zone principale
@@ -503,7 +563,7 @@ def main():
         errors = []
         
         # Récupérer le nombre de workers depuis la session state ou utiliser la valeur par défaut
-        num_workers = st.session_state.get('num_workers', 4)
+        num_workers = st.session_state.get('num_workers', 8)
         
         # Barre de progression
         progress_bar = st.progress(0)
