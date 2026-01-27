@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
-from datetime import datetime
 
 # Charger les variables d'environnement
 load_dotenv()
@@ -76,7 +75,6 @@ def extract_text_from_pdf(pdf_file) -> str:
     Returns:
         str: Texte brut concaténé de toutes les pages
     """
-    log_path = r"c:\Users\matdi\Documents\myApps\pdf-merge-converted\.cursor\debug.log"
     try:
         # Lire le contenu du fichier uploadé
         pdf_bytes = pdf_file.read()
@@ -85,11 +83,6 @@ def extract_text_from_pdf(pdf_file) -> str:
         # Ouvrir le PDF avec PyMuPDF
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         
-        # #region agent log
-        with open(log_path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps({"id": f"log_{int(time.time())}_extract_start", "timestamp": int(time.time() * 1000), "location": "app.py:82", "message": "extract_text_from_pdf - PDF opened", "data": {"filename": pdf_file.name, "page_count": len(doc)}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
-        # #endregion
-        
         full_text = []
         for page_num in range(len(doc)):
             page = doc[page_num]
@@ -97,26 +90,7 @@ def extract_text_from_pdf(pdf_file) -> str:
             full_text.append(f"--- Page {page_num + 1} ---\n{text}")
         
         doc.close()
-        extracted_text = "\n\n".join(full_text)
-        
-        # #region agent log
-        with open(log_path, 'a', encoding='utf-8') as f:
-            # Chercher des dates dans le texte extrait pour vérifier la présence des dates problématiques
-            date_patterns = [
-                r'25/02/2025', r'26/02/2025', r'27/02/2025', r'28/02/2025',
-                r'13/03/2025', r'31/03/2025',
-                r'14/04/2025', r'30/04/2025',
-                r'09/12/2025', r'31/12/2025'
-            ]
-            found_dates = {}
-            for pattern in date_patterns:
-                matches = re.findall(pattern, extracted_text)
-                if matches:
-                    found_dates[pattern] = len(matches)
-            f.write(json.dumps({"id": f"log_{int(time.time())}_extract_end", "timestamp": int(time.time() * 1000), "location": "app.py:91", "message": "extract_text_from_pdf - text extracted", "data": {"filename": pdf_file.name, "text_length": len(extracted_text), "found_problematic_dates": found_dates}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
-        # #endregion
-        
-        return extracted_text
+        return "\n\n".join(full_text)
     
     except Exception as e:
         raise Exception(f"Erreur lors de la lecture du PDF: {str(e)}")
@@ -142,12 +116,6 @@ def analyze_with_gemini(text: str, api_key: str, max_retries: int = 3) -> str:
             # Construire le prompt complet
             full_prompt = SYSTEM_PROMPT + text
             
-            # #region agent log
-            log_path = r"c:\Users\matdi\Documents\myApps\pdf-merge-converted\.cursor\debug.log"
-            with open(log_path, 'a', encoding='utf-8') as f:
-                f.write(json.dumps({"id": f"log_{int(time.time())}_gemini_req", "timestamp": int(time.time() * 1000), "location": "app.py:115", "message": "Gemini request - input text length", "data": {"text_length": len(text), "prompt_length": len(full_prompt)}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
-            # #endregion
-            
             # Générer la réponse avec mode JSON structuré
             response = model.generate_content(
                 full_prompt,
@@ -157,11 +125,6 @@ def analyze_with_gemini(text: str, api_key: str, max_retries: int = 3) -> str:
                     response_mime_type="application/json",  # Force Gemini à produire un JSON valide
                 )
             )
-            
-            # #region agent log
-            with open(log_path, 'a', encoding='utf-8') as f:
-                f.write(json.dumps({"id": f"log_{int(time.time())}_gemini_resp", "timestamp": int(time.time() * 1000), "location": "app.py:127", "message": "Gemini response - raw response length", "data": {"response_length": len(response.text), "response_preview": response.text[:200]}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
-            # #endregion
             
             return response.text
         
@@ -193,12 +156,6 @@ def repair_json(json_string: str) -> str:
     Returns:
         str: Chaîne JSON nettoyée et réparée
     """
-    # #region agent log
-    log_path = r"c:\Users\matdi\Documents\myApps\pdf-merge-converted\.cursor\debug.log"
-    with open(log_path, 'a', encoding='utf-8') as f:
-        f.write(json.dumps({"id": f"log_{int(time.time())}_repair_before", "timestamp": int(time.time() * 1000), "location": "app.py:157", "message": "repair_json - before repair", "data": {"input_length": len(json_string), "input_preview": json_string[:300]}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
-    # #endregion
-    
     cleaned = json_string.strip()
     
     # Enlever les marqueurs markdown
@@ -218,12 +175,7 @@ def repair_json(json_string: str) -> str:
     open_braces = cleaned.count('{') - cleaned.count('}')
     open_brackets = cleaned.count('[') - cleaned.count(']')
     
-    was_truncated = False
-    chars_removed = 0
-    
     if open_braces > 0 or open_brackets > 0:
-        was_truncated = True
-        original_length = len(cleaned)
         # Tronquer au dernier objet complet et fermer le tableau
         last_complete = cleaned.rfind('},')
         if last_complete > 0:
@@ -233,12 +185,6 @@ def repair_json(json_string: str) -> str:
             last_obj = cleaned.rfind('}')
             if last_obj > 0:
                 cleaned = cleaned[:last_obj + 1] + ']'
-        chars_removed = original_length - len(cleaned)
-    
-    # #region agent log
-    with open(log_path, 'a', encoding='utf-8') as f:
-        f.write(json.dumps({"id": f"log_{int(time.time())}_repair_after", "timestamp": int(time.time() * 1000), "location": "app.py:187", "message": "repair_json - after repair", "data": {"output_length": len(cleaned), "was_truncated": was_truncated, "chars_removed": chars_removed, "open_braces": open_braces, "open_brackets": open_brackets}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
-    # #endregion
     
     return cleaned
 
@@ -254,19 +200,12 @@ def parse_llm_response(response: str, filename: str) -> pd.DataFrame:
     Returns:
         pd.DataFrame: DataFrame avec les transactions
     """
-    log_path = r"c:\Users\matdi\Documents\myApps\pdf-merge-converted\.cursor\debug.log"
     try:
         # Utiliser repair_json pour nettoyer et réparer la réponse
         cleaned = repair_json(response)
         
         # Parser le JSON
         transactions = json.loads(cleaned)
-        
-        # #region agent log
-        with open(log_path, 'a', encoding='utf-8') as f:
-            dates = [t.get('date', '') for t in transactions if isinstance(t, dict)]
-            f.write(json.dumps({"id": f"log_{int(time.time())}_parse_before", "timestamp": int(time.time() * 1000), "location": "app.py:206", "message": "parse_llm_response - transactions parsed", "data": {"filename": filename, "transaction_count": len(transactions), "dates": dates[:10] if dates else [], "date_count": len(dates)}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "C"}) + "\n")
-        # #endregion
         
         if not isinstance(transactions, list):
             raise ValueError("La réponse n'est pas une liste de transactions")
@@ -300,25 +239,6 @@ def parse_llm_response(response: str, filename: str) -> pd.DataFrame:
             if col not in df.columns:
                 df[col] = None
         df = df[expected_cols]
-        
-        # #region agent log
-        with open(log_path, 'a', encoding='utf-8') as f:
-            dates_in_df = df['Date'].dropna().tolist() if 'Date' in df.columns else []
-            date_ranges = {}
-            if dates_in_df:
-                try:
-                    parsed_dates = []
-                    for d in dates_in_df:
-                        try:
-                            parsed_dates.append(datetime.strptime(d, "%d/%m/%Y"))
-                        except:
-                            pass
-                    if parsed_dates:
-                        date_ranges = {"min_date": min(parsed_dates).strftime("%d/%m/%Y"), "max_date": max(parsed_dates).strftime("%d/%m/%Y"), "unique_dates": len(set(parsed_dates))}
-                except:
-                    pass
-            f.write(json.dumps({"id": f"log_{int(time.time())}_parse_after", "timestamp": int(time.time() * 1000), "location": "app.py:240", "message": "parse_llm_response - final DataFrame", "data": {"filename": filename, "row_count": len(df), "date_ranges": date_ranges, "sample_dates": dates_in_df[:5]}, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "C"}) + "\n")
-        # #endregion
         
         return df
     
