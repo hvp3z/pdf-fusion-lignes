@@ -381,6 +381,18 @@ def verify_api_key(api_key: str) -> bool:
 def main():
     """Fonction principale de l'application."""
     
+    # CSS pour cacher la sidebar par défaut
+    st.markdown("""
+    <style>
+        [data-testid="stSidebar"] {
+            display: none;
+        }
+        [data-testid="stSidebar"][aria-expanded="true"] {
+            display: block;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+    
     # Titre principal
     st.title("📊 Extracteur Comptable IA")
     st.markdown("*Extrayez automatiquement les lignes comptables de vos relevés bancaires PDF*")
