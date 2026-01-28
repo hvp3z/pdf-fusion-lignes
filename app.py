@@ -101,9 +101,46 @@ def extract_text_from_pdf(pdf_file) -> str:
         raise Exception(f"Erreur lors de la lecture du PDF: {str(e)}")
 
 
+def is_json_truncated(json_string: str) -> bool:
+    """
+    Vérifie si une chaîne JSON semble tronquée.
+    
+    Args:
+        json_string: Chaîne JSON à vérifier
+        
+    Returns:
+        bool: True si le JSON semble tronqué
+    """
+    cleaned = json_string.strip()
+    
+    # Enlever les marqueurs markdown pour l'analyse
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    if cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+    
+    # Vérifier si les brackets sont équilibrés
+    open_braces = cleaned.count('{') - cleaned.count('}')
+    open_brackets = cleaned.count('[') - cleaned.count(']')
+    
+    # Si déséquilibré, c'est tronqué
+    if open_braces != 0 or open_brackets != 0:
+        return True
+    
+    # Vérifier si ça se termine correctement pour un tableau JSON
+    if not cleaned.endswith(']'):
+        return True
+    
+    return False
+
+
 def analyze_with_gemini(text: str, api_key: str, max_retries: int = 3) -> str:
     """
     Envoie le texte au modèle Gemini pour analyse avec retry automatique.
+    Inclut une détection de troncature avec retry.
     
     Args:
         text: Texte extrait du PDF
@@ -113,6 +150,9 @@ def analyze_with_gemini(text: str, api_key: str, max_retries: int = 3) -> str:
     Returns:
         str: Réponse du modèle (JSON attendu)
     """
+    best_response = None
+    best_length = 0
+    
     for attempt in range(max_retries):
         try:
             genai.configure(api_key=api_key)
@@ -125,13 +165,28 @@ def analyze_with_gemini(text: str, api_key: str, max_retries: int = 3) -> str:
             response = model.generate_content(
                 full_prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0.1,  # Basse température pour plus de précision
-                    max_output_tokens=32768,  # Augmenté pour éviter la troncature (limite max de Gemini)
+                    temperature=0,  # Température 0 pour résultats déterministes
+                    max_output_tokens=32768,  # Limite max de Gemini
                     response_mime_type="application/json",  # Force Gemini à produire un JSON valide
                 )
             )
             
-            return response.text
+            response_text = response.text
+            
+            # Garder la meilleure réponse (la plus longue)
+            if len(response_text) > best_length:
+                best_length = len(response_text)
+                best_response = response_text
+            
+            # Vérifier si la réponse semble tronquée
+            if is_json_truncated(response_text):
+                print(f"[WARNING] Réponse potentiellement tronquée (tentative {attempt + 1}/{max_retries}), retry...")
+                if attempt < max_retries - 1:
+                    time.sleep(1)  # Petit délai avant retry
+                    continue
+            
+            # Réponse complète, on peut la retourner
+            return response_text
         
         except Exception as e:
             error_msg = str(e).lower()
@@ -148,7 +203,16 @@ def analyze_with_gemini(text: str, api_key: str, max_retries: int = 3) -> str:
                 time.sleep(1)
                 continue
             else:
+                # Si on a une réponse partielle, la retourner plutôt que de lever une erreur
+                if best_response:
+                    print(f"[WARNING] Utilisation de la meilleure réponse partielle après {max_retries} tentatives")
+                    return best_response
                 raise Exception(f"Erreur API Gemini après {max_retries} tentatives: {str(e)}")
+    
+    # Retourner la meilleure réponse obtenue
+    if best_response:
+        return best_response
+    raise Exception("Aucune réponse valide obtenue de Gemini")
 
 
 def repair_json(json_string: str) -> str:
