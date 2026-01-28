@@ -198,11 +198,13 @@ def validate_and_fix_debit_credit(df: pd.DataFrame) -> pd.DataFrame:
     """
     Valide et corrige les erreurs de classification débit/crédit.
     
-    Règles de correction :
-    - "VIREMENT A" ou "VIREMENT INSTANTANE A" = DÉBIT (sortie d'argent)
-    - "VIREMENT DE" ou "VIREMENT INSTANTANE DE" = CRÉDIT (entrée d'argent)
-    - "ACHAT CB", "PRELEVEMENT", "RETRAIT" = DÉBIT
-    - "CREDIT CARTE", "REMBOURSEMENT" = CRÉDIT
+    Priorité des règles (du plus spécifique au plus générique) :
+    1. VIREMENTS (priorité haute - déterminent clairement la direction)
+       - "VIREMENT A" ou "VIREMENT INSTANTANE A" = DÉBIT (sortie d'argent)
+       - "VIREMENT DE" ou "VIREMENT INSTANTANE DE" = CRÉDIT (entrée d'argent)
+    2. Autres patterns (priorité basse - seulement si pas de virement)
+       - "ACHAT CB", "PRELEVEMENT", "RETRAIT" = DÉBIT
+       - "CREDIT CARTE", "REMBOURSEMENT" = CRÉDIT
     
     Args:
         df: DataFrame avec les transactions
@@ -213,10 +215,18 @@ def validate_and_fix_debit_credit(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "Libellé" not in df.columns:
         return df
     
-    # Patterns qui doivent être des DÉBITS (sorties d'argent)
-    debit_patterns = [
+    # PRIORITÉ 1 : Patterns de virement (les plus spécifiques)
+    virement_debit_patterns = [
         r'VIREMENT\s+(INSTANTANE\s+)?A\s+',  # VIREMENT A ou VIREMENT INSTANTANE A
         r'VIREMENT\s+POUR\s+',  # VIREMENT POUR
+    ]
+    
+    virement_credit_patterns = [
+        r'VIREMENT\s+(INSTANTANE\s+)?DE\s+',  # VIREMENT DE ou VIREMENT INSTANTANE DE
+    ]
+    
+    # PRIORITÉ 2 : Autres patterns (moins spécifiques)
+    other_debit_patterns = [
         r'ACHAT\s+CB',
         r'PRELEVEMENT',
         r'RETRAIT\s+DAB',
@@ -225,9 +235,7 @@ def validate_and_fix_debit_credit(df: pd.DataFrame) -> pd.DataFrame:
         r'FRAIS',
     ]
     
-    # Patterns qui doivent être des CRÉDITS (entrées d'argent)
-    credit_patterns = [
-        r'VIREMENT\s+(INSTANTANE\s+)?DE\s+',  # VIREMENT DE ou VIREMENT INSTANTANE DE
+    other_credit_patterns = [
         r'CREDIT\s+CARTE',
         r'REMBOURSEMENT',
     ]
@@ -239,25 +247,51 @@ def validate_and_fix_debit_credit(df: pd.DataFrame) -> pd.DataFrame:
         debit = row.get("Débit")
         credit = row.get("Crédit")
         
-        # Vérifier si c'est un pattern de débit mal classifié en crédit
-        for pattern in debit_patterns:
+        pattern_matched = False
+        
+        # ÉTAPE 1 : Vérifier les patterns de virement EN PREMIER (priorité haute)
+        # Virement sortant (A) = DÉBIT
+        for pattern in virement_debit_patterns:
             if re.search(pattern, libelle, re.IGNORECASE):
-                # Si le montant est en crédit alors qu'il devrait être en débit
                 if pd.notna(credit) and pd.isna(debit):
                     df.at[idx, "Débit"] = credit
                     df.at[idx, "Crédit"] = None
                     corrections_count += 1
+                pattern_matched = True
                 break
         
-        # Vérifier si c'est un pattern de crédit mal classifié en débit
-        for pattern in credit_patterns:
-            if re.search(pattern, libelle, re.IGNORECASE):
-                # Si le montant est en débit alors qu'il devrait être en crédit
-                if pd.notna(debit) and pd.isna(credit):
-                    df.at[idx, "Crédit"] = debit
-                    df.at[idx, "Débit"] = None
-                    corrections_count += 1
-                break
+        # Virement entrant (DE) = CRÉDIT
+        if not pattern_matched:
+            for pattern in virement_credit_patterns:
+                if re.search(pattern, libelle, re.IGNORECASE):
+                    if pd.notna(debit) and pd.isna(credit):
+                        df.at[idx, "Crédit"] = debit
+                        df.at[idx, "Débit"] = None
+                        corrections_count += 1
+                    pattern_matched = True
+                    break
+        
+        # ÉTAPE 2 : Seulement si pas de virement, vérifier les autres patterns
+        if not pattern_matched:
+            # Autres débits
+            for pattern in other_debit_patterns:
+                if re.search(pattern, libelle, re.IGNORECASE):
+                    if pd.notna(credit) and pd.isna(debit):
+                        df.at[idx, "Débit"] = credit
+                        df.at[idx, "Crédit"] = None
+                        corrections_count += 1
+                    pattern_matched = True
+                    break
+            
+            # Autres crédits
+            if not pattern_matched:
+                for pattern in other_credit_patterns:
+                    if re.search(pattern, libelle, re.IGNORECASE):
+                        if pd.notna(debit) and pd.isna(credit):
+                            df.at[idx, "Crédit"] = debit
+                            df.at[idx, "Débit"] = None
+                            corrections_count += 1
+                        break
     
     if corrections_count > 0:
         print(f"[INFO] {corrections_count} transaction(s) corrigée(s) (débit/crédit)")
