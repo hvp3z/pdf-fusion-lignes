@@ -48,7 +48,12 @@ RÈGLES IMPORTANTES :
    - "1.000,50" → 1000.50
    - "1,000.50" → 1000.50
    - "1000,50" → 1000.50
-2. Ne confonds pas débit et crédit. Un débit est une sortie d'argent (paiement), un crédit est une entrée (virement reçu).
+2. DISTINCTION DÉBIT/CRÉDIT (CRITIQUE) :
+   - DÉBIT (sortie d'argent) : paiements CB, prélèvements, virements VERS quelqu'un
+   - CRÉDIT (entrée d'argent) : virements REÇUS, remboursements
+   - ATTENTION aux virements : "VIREMENT A [nom]" ou "VIREMENT INSTANTANE A [nom]" = DÉBIT (argent qui SORT)
+   - "VIREMENT DE [nom]" ou "VIREMENT INSTANTANE DE [nom]" = CRÉDIT (argent qui ENTRE)
+   - Dans le PDF, le montant est généralement dans la colonne Débit ou Crédit - respecte cette position.
 3. Ignore les lignes qui ne sont pas des transactions (soldes, totaux, en-têtes, etc.).
 4. Si une transaction s'étend sur plusieurs lignes dans le PDF, reconstitue-la correctement.
 5. CRITIQUE : Extrais ABSOLUMENT TOUTES les transactions, y compris celles en fin de relevé. Ne tronque pas ta réponse même si elle est longue.
@@ -189,6 +194,77 @@ def repair_json(json_string: str) -> str:
     return cleaned
 
 
+def validate_and_fix_debit_credit(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Valide et corrige les erreurs de classification débit/crédit.
+    
+    Règles de correction :
+    - "VIREMENT A" ou "VIREMENT INSTANTANE A" = DÉBIT (sortie d'argent)
+    - "VIREMENT DE" ou "VIREMENT INSTANTANE DE" = CRÉDIT (entrée d'argent)
+    - "ACHAT CB", "PRELEVEMENT", "RETRAIT" = DÉBIT
+    - "CREDIT CARTE", "REMBOURSEMENT" = CRÉDIT
+    
+    Args:
+        df: DataFrame avec les transactions
+        
+    Returns:
+        pd.DataFrame: DataFrame corrigé
+    """
+    if df.empty or "Libellé" not in df.columns:
+        return df
+    
+    # Patterns qui doivent être des DÉBITS (sorties d'argent)
+    debit_patterns = [
+        r'VIREMENT\s+(INSTANTANE\s+)?A\s+',  # VIREMENT A ou VIREMENT INSTANTANE A
+        r'VIREMENT\s+POUR\s+',  # VIREMENT POUR
+        r'ACHAT\s+CB',
+        r'PRELEVEMENT',
+        r'RETRAIT\s+DAB',
+        r'COMMISSION',
+        r'COTISATION',
+        r'FRAIS',
+    ]
+    
+    # Patterns qui doivent être des CRÉDITS (entrées d'argent)
+    credit_patterns = [
+        r'VIREMENT\s+(INSTANTANE\s+)?DE\s+',  # VIREMENT DE ou VIREMENT INSTANTANE DE
+        r'CREDIT\s+CARTE',
+        r'REMBOURSEMENT',
+    ]
+    
+    corrections_count = 0
+    
+    for idx, row in df.iterrows():
+        libelle = str(row.get("Libellé", "")).upper()
+        debit = row.get("Débit")
+        credit = row.get("Crédit")
+        
+        # Vérifier si c'est un pattern de débit mal classifié en crédit
+        for pattern in debit_patterns:
+            if re.search(pattern, libelle, re.IGNORECASE):
+                # Si le montant est en crédit alors qu'il devrait être en débit
+                if pd.notna(credit) and pd.isna(debit):
+                    df.at[idx, "Débit"] = credit
+                    df.at[idx, "Crédit"] = None
+                    corrections_count += 1
+                break
+        
+        # Vérifier si c'est un pattern de crédit mal classifié en débit
+        for pattern in credit_patterns:
+            if re.search(pattern, libelle, re.IGNORECASE):
+                # Si le montant est en débit alors qu'il devrait être en crédit
+                if pd.notna(debit) and pd.isna(credit):
+                    df.at[idx, "Crédit"] = debit
+                    df.at[idx, "Débit"] = None
+                    corrections_count += 1
+                break
+    
+    if corrections_count > 0:
+        print(f"[INFO] {corrections_count} transaction(s) corrigée(s) (débit/crédit)")
+    
+    return df
+
+
 def parse_llm_response(response: str, filename: str) -> pd.DataFrame:
     """
     Parse la réponse JSON du LLM et la convertit en DataFrame.
@@ -232,6 +308,9 @@ def parse_llm_response(response: str, filename: str) -> pd.DataFrame:
         for col in ["Débit", "Crédit"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Valider et corriger les erreurs débit/crédit
+        df = validate_and_fix_debit_credit(df)
         
         # Réordonner les colonnes
         expected_cols = ["Date", "Libellé", "Débit", "Crédit", "Source"]
