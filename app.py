@@ -294,9 +294,7 @@ def validate_and_fix_debit_credit(df: pd.DataFrame) -> pd.DataFrame:
         r'ACHAT\s+CB',
         r'PRELEVEMENT',
         r'RETRAIT\s+DAB',
-        r'COMMISSION',
-        r'COTISATION',
-        r'FRAIS',
+        # Retirés : COMMISSION, COTISATION, FRAIS (ambigus - la direction dépend du contexte)
     ]
     
     other_credit_patterns = [
